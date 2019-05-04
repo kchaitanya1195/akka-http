@@ -51,6 +51,8 @@ private[http] final class HttpRequestParser(
     private[this] var uri: Uri = _
     private[this] var uriBytes: ByteString = _
 
+    private[this] var proxyProtocolHeader: HttpHeader = _
+
     override def onPush(): Unit = handleParserOutput(parseSessionBytes(grab(in)))
     override def onPull(): Unit = handleParserOutput(doPull())
 
@@ -70,19 +72,62 @@ private[http] final class HttpRequestParser(
 
     override def parseMessage(input: ByteString, offset: Int): StateResult =
       if (offset < input.length) {
-        var cursor = parseMethod(input, offset)
+        var cursor = parseProxyProtocol(input, offset)
+        val initHeaders = initialHeaderBuffer ++= (if (cursor == 0) List.empty[HttpHeader] else List(proxyProtocolHeader))
+
+        cursor = parseMethod(input, offset)
         cursor = parseRequestTarget(input, cursor)
         cursor = parseProtocol(input, cursor)
         if (byteChar(input, cursor) == '\r' && byteChar(input, cursor + 1) == '\n')
-          parseHeaderLines(input, cursor + 2)
+          parseHeaderLines(input, cursor + 2, headers = initHeaders)
         else if (byteChar(input, cursor) == '\n')
-          parseHeaderLines(input, cursor + 1)
+          parseHeaderLines(input, cursor + 1, headers = initHeaders)
         else onBadProtocol()
       } else
         // Without HTTP pipelining it's likely that buffer is exhausted after reading one message,
         // so we check above explicitly if we are done and stop work here without running into NotEnoughDataException
         // when continuing to parse.
         continue(startNewMessage)
+
+    def parseProxyProtocol(input: ByteString, cursor: Int): Int = {
+      val headerName = "PROXY"
+      val maxProxyHeaderLength = 108
+
+      @tailrec def parseProxyHeader(ix: Int = 0): Int = {
+        if (ix == 5) {
+          byteChar(input, cursor + ix) match {
+            case ' ' ⇒
+              // Matched 'PROXY'
+              parseProxyIPs(ix + 1)
+            case _ ⇒
+              // Matched custom method
+              0
+          }
+        } else if (byteChar(input, cursor + ix) == headerName.charAt(ix)) parseProxyHeader(ix + 1)
+        else 0
+      }
+
+      @tailrec def parseProxyIPs(ix: Int, sb: JStringBuilder = new JStringBuilder(16)): Int = {
+        if (ix < maxProxyHeaderLength) {
+          byteChar(input, cursor + ix) match {
+            case '\r' ⇒
+              if (byteChar(input, cursor + ix + 1) == '\n') {
+                proxyProtocolHeader = RawHeader("PROXY", sb.toString)
+                cursor + ix + 2
+              } else
+                throw new ParsingException(
+                  BadRequest,
+                  ErrorInfo("Invalid proxy header line", s"Invalid CLRF for proxy protocol line"))
+            case c ⇒ parseProxyIPs(ix + 1, sb.append(c))
+          }
+        } else
+          throw new ParsingException(
+            BadRequest,
+            ErrorInfo("Invalid proxy header line", s"CLRF not found within the first 107 characters of proxy protocol line"))
+      }
+
+      parseProxyHeader()
+    }
 
     def parseMethod(input: ByteString, cursor: Int): Int = {
       @tailrec def parseCustomMethod(ix: Int = 0, sb: JStringBuilder = new JStringBuilder(16)): Int =
